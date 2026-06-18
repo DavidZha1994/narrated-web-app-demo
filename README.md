@@ -24,6 +24,8 @@ patch that adds what real product demos need.
 | **Popup suppression** | No translate bar / save-password bubble / notifications in the recording. |
 | **`exact` role matching** | Disambiguate `high` vs `xhigh`, `Default` vs `Set as default`. |
 | **Non-destructive `close`** | Graceful shutdown that flushes & **preserves** the profile + `auth.json` (upstream wiped them). |
+| **Polish: zoom / framing / music / outro** | Optional cinematic zoom toward the active element, window framing (padded background + shadow), ducked music bed, and an end card — via a `polish` block. |
+| **Non-fatal `done`** | A timed-out readiness check logs and continues instead of crashing the render — makes smart `done: { stable }` waits safe (no guessed fixed waits, no dead time). |
 
 ## Install
 

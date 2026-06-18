@@ -155,9 +155,22 @@ ffmpeg -i demo.mp4 -i music.mp3 -filter_complex \
   "[1:a]volume=0.12[m];[0:a][m]amix=inputs=2:duration=first" -c:v copy demo-music.mp4
 ```
 
-**Roadmap (not yet built — see README):** cinematic zoom/pan onto the active
-element (the biggest visual gap vs Screen Studio / playwright-recast),
-auto speed-up of idle stretches, and window framing (padding + shadow + background).
+**Polish (built — opt-in via a `polish` block + `outro`):**
+```yaml
+outro: { title: "Thanks", subtitle: "...", duration: 3500 }   # end card
+polish:
+  zoom:    { enabled: true, scale: 1.3 }        # cinematic zoom toward the first
+                                                #   focus action of each segment,
+                                                #   held, reset on scene change
+  framing: { enabled: true, background: "#e6e6ec", padding: 0.045, shadow: true }
+  music:   { file: "/abs/path/bed.mp3", volume: 0.12 }   # ducked music bed
+```
+- **zoom** — CSS-transform zoom toward the element being acted on; composes with
+  the base browser zoom. Reset (zoom-out) at each segment start.
+- **framing** — scales the capture onto a padded background with a soft shadow.
+- **music** — loops + ducks a track under the narration (you supply the file).
+- **idle speed-up** — not a flag: use smart `done: { stable: ... }` waits so a
+  segment ends the moment the page settles (no dead time). `done` is non-fatal.
 
 ## References
 

@@ -29,6 +29,13 @@ tts:
 
 recording: { outputDir: ".", fps: 30 }
 
+# Optional polish (all off by default). See SKILL.md → Polish.
+outro: { title: "Thanks for watching", subtitle: "Your App", duration: 3500 }
+polish:
+  zoom:    { enabled: true, scale: 1.3 }                 # zoom toward each segment's first action
+  framing: { enabled: true, background: "#e6e6ec", padding: 0.045, shadow: true }
+  # music: { file: "/ABSOLUTE/path/to/bed.mp3", volume: 0.12 }
+
 segments:
   # Static opener — narration plays over the start page.
   - id: intro

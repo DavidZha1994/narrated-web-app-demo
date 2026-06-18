@@ -183,14 +183,58 @@ index c389daf..79a5242 100644
  // ─── reset ───────────────────────────────────────────
  
  program
+diff --git a/src/cursor.ts b/src/cursor.ts
+index cb5a69b..41f0d43 100644
+--- a/src/cursor.ts
++++ b/src/cursor.ts
+@@ -156,4 +156,35 @@ async function hideCursor(page: Page): Promise<void> {
+   });
+ }
+ 
+-export { injectCursor, pointAt, clickEffect, hideCursor };
++/**
++ * Cinematic zoom: ease the whole page toward an element. Uses a CSS transform
++ * on <html>, which composes on top of the browser-level zoom (the zoom
++ * extension uses chrome.tabs.setZoom, not a transform, so they don't fight).
++ * transform-origin is the element's document-space center, so the element
++ * stays anchored while everything scales around it.
++ */
++async function zoomTo(page: Page, locator: Locator, scale: number): Promise<void> {
++  const pos = await getElementPosition(locator);
++  if (!pos) return;
++  await page.evaluate(({ cx, cy, scale }: { cx: number; cy: number; scale: number }) => {
++    const el = document.documentElement;
++    el.style.transformOrigin = `${cx + window.scrollX}px ${cy + window.scrollY}px`;
++    el.style.transition = "transform 0.7s cubic-bezier(0.22, 1, 0.36, 1)";
++    el.style.transform = `scale(${scale})`;
++  }, { cx: pos.cx, cy: pos.cy, scale });
++  await page.waitForTimeout(700);
++}
++
++/** Ease the page back to its natural scale (scene change). */
++async function zoomReset(page: Page): Promise<void> {
++  const had = await page.evaluate(() => {
++    const el = document.documentElement;
++    if (!el.style.transform) return false;
++    el.style.transition = "transform 0.5s cubic-bezier(0.22, 1, 0.36, 1)";
++    el.style.transform = "";
++    return true;
++  }).catch(() => false);
++  if (had) await page.waitForTimeout(500);
++}
++
++export { injectCursor, pointAt, clickEffect, hideCursor, zoomTo, zoomReset };
 diff --git a/src/executor.ts b/src/executor.ts
-index 22b5d2f..5c2cae4 100644
+index 22b5d2f..125ba87 100644
 --- a/src/executor.ts
 +++ b/src/executor.ts
-@@ -4,6 +4,19 @@ import { toLocator } from "./locators.js";
+@@ -2,12 +2,25 @@ import type { Page } from "playwright";
+ import type { Action, Segment } from "./schema.js";
+ import { toLocator } from "./locators.js";
  import { waitForDone } from "./waiters.js";
- import { pointAt, clickEffect, hideCursor } from "./cursor.js";
- 
+-import { pointAt, clickEffect, hideCursor } from "./cursor.js";
++import { pointAt, clickEffect, hideCursor, zoomTo, zoomReset } from "./cursor.js";
++
 +// Non-fatal readiness wait. A `done` condition that times out or errors must
 +// NOT crash the whole render — log and continue. This makes smart waits
 +// (done: { stable }, { networkIdle }) safe to use instead of guessed fixed
@@ -203,10 +247,15 @@ index 22b5d2f..5c2cae4 100644
 +    console.error(`  (done not met, continuing: ${String(err).split("\n")[0]})`);
 +  }
 +}
-+
+ 
  async function executeAction(
    page: Page,
    action: Action,
+-  options: { cursor?: boolean } = {}
++  options: { cursor?: boolean; zoom?: number } = {}
+ ): Promise<void> {
+   const showCursor = options.cursor ?? false;
+ 
 @@ -18,7 +31,16 @@ async function executeAction(
  
    if (action.type === "press") {
@@ -225,7 +274,21 @@ index 22b5d2f..5c2cae4 100644
      return;
    }
  
-@@ -56,7 +78,7 @@ async function executeAction(
+@@ -29,6 +51,13 @@ async function executeAction(
+     await pointAt(page, locator);
+   }
+ 
++  // Cinematic zoom toward the interaction target (caller gates to the first
++  // focus action per segment).
++  if (options.zoom && (action.type === "click" || action.type === "type"
++      || action.type === "select")) {
++    await zoomTo(page, locator, options.zoom);
++  }
++
+   switch (action.type) {
+     case "click":
+       if (showCursor) await clickEffect(page);
+@@ -56,7 +85,7 @@ async function executeAction(
    }
  
    if (action.done) {
@@ -234,6 +297,38 @@ index 22b5d2f..5c2cae4 100644
    }
  }
  
+@@ -96,6 +125,7 @@ async function executeSegment(
+  */
+ interface RunSegmentOptions {
+   cursor?: boolean;
++  zoom?: number;
+   audioDurationMs?: number;
+   playAudio?: () => { kill: () => void; promise: Promise<unknown> };
+   onActionStart?: (action: Action, index: number) => void;
+@@ -127,13 +157,22 @@ async function runSegment(
+     }
+   }
+ 
++  // Cinematic zoom: reset to natural scale at the scene start, then zoom into
++  // the first focus action of the segment and hold for the rest.
++  if (options.zoom) await zoomReset(page);
++  let zoomed = false;
++
+   // Execute actions
+   for (let i = 0; i < segment.actions.length; i++) {
+     const action = segment.actions[i];
+     options.onActionStart?.(action, i);
+ 
++    const isFocus = action.type === "click" || action.type === "type" || action.type === "select";
++    const zoomThis = options.zoom && !zoomed && isFocus && action.target ? options.zoom : undefined;
++    if (zoomThis) zoomed = true;
++
+     try {
+-      await executeAction(page, action, { cursor: options.cursor });
++      await executeAction(page, action, { cursor: options.cursor, zoom: zoomThis });
+       options.onActionDone?.(action, i);
+     } catch (err) {
+       options.onActionError?.(err, action, i);
 diff --git a/src/locators.ts b/src/locators.ts
 index 93d61d5..01da713 100644
 --- a/src/locators.ts
@@ -249,8 +344,73 @@ index 93d61d5..01da713 100644
      return page.getByRole(target.role as any, opts);
    }
    if (target.label) return page.getByLabel(target.label);
+diff --git a/src/merger.ts b/src/merger.ts
+index e47a70e..7c1eff7 100644
+--- a/src/merger.ts
++++ b/src/merger.ts
+@@ -16,6 +16,8 @@ interface MergeOptions {
+   outputDir: string;
+   /** Total dead time before the first segment (title card + navigation). */
+   preSegmentDurationMs?: number;
++  /** Optional background music bed, ducked under the narration. */
++  music?: { file: string; volume: number };
+ }
+ 
+ async function mergeAudioVideo(options: MergeOptions): Promise<void> {
+@@ -69,22 +71,39 @@ async function mergeAudioVideo(options: MergeOptions): Promise<void> {
+     .join("\n");
+   fs.writeFileSync(filelistPath, filelistContent);
+ 
+-  // Concatenate audio
++  // Concatenate audio (re-encode to a uniform format so concat is safe)
+   const combinedAudioPath = path.join(outputDir, "combined-audio.mp3");
+   await execa("ffmpeg", [
+     "-y",
+     "-f", "concat",
+     "-safe", "0",
+     "-i", filelistPath,
+-    "-c", "copy",
++    "-ar", "44100", "-ac", "1",
+     combinedAudioPath,
+   ]);
+ 
++  // Optional music bed: loop the track, lower its volume, and mix under the
++  // narration (the narration stays at full volume; music fills the rest).
++  let narrationPath = combinedAudioPath;
++  if (options.music) {
++    const mixedPath = path.join(outputDir, "narration-music.mp3");
++    await execa("ffmpeg", [
++      "-y",
++      "-i", combinedAudioPath,
++      "-stream_loop", "-1", "-i", path.resolve(options.music.file),
++      "-filter_complex",
++      `[1:a]volume=${options.music.volume}[m];[0:a][m]amix=inputs=2:duration=first:dropout_transition=0[a]`,
++      "-map", "[a]", "-ar", "44100", "-ac", "2",
++      mixedPath,
++    ]);
++    narrationPath = mixedPath;
++  }
++
+   // Merge audio + video (video is already H.264, just mux)
+   await execa("ffmpeg", [
+     "-y",
+     "-i", videoPath,
+-    "-i", combinedAudioPath,
++    "-i", narrationPath,
+     "-c:v", "copy",
+     "-c:a", "aac",
+     "-b:a", "192k",
+@@ -97,6 +116,8 @@ async function mergeAudioVideo(options: MergeOptions): Promise<void> {
+   try {
+     fs.unlinkSync(filelistPath);
+     fs.unlinkSync(combinedAudioPath);
++    const mixedPath = path.join(outputDir, "narration-music.mp3");
++    if (fs.existsSync(mixedPath)) fs.unlinkSync(mixedPath);
+     const titleSilencePath = path.join(outputDir, "audio", "silence-titlecard.mp3");
+     if (fs.existsSync(titleSilencePath)) fs.unlinkSync(titleSilencePath);
+     for (const segment of segments) {
 diff --git a/src/renderer.ts b/src/renderer.ts
-index f47c7ac..384c812 100644
+index f47c7ac..97f9442 100644
 --- a/src/renderer.ts
 +++ b/src/renderer.ts
 @@ -75,11 +75,24 @@ async function render(
@@ -317,7 +477,15 @@ index f47c7ac..384c812 100644
    await setBrowserZoom(page, zoomPercent);
  
    if (playbook.app.setup) {
-@@ -201,7 +239,6 @@ async function render(
+@@ -189,6 +227,7 @@ async function render(
+ 
+     const result = await runSegment(page, segment, {
+       cursor: true,
++      zoom: playbook.polish?.zoom?.enabled ? playbook.polish.zoom.scale : undefined,
+       audioDurationMs: segment.audioDuration!,
+       onActionError: async (err, action, actionIndex) => {
+         await page.screenshot({
+@@ -201,7 +240,6 @@ async function render(
        await cdp.send("Page.stopScreencast");
        await cdp.detach();
        await context.close();
@@ -325,7 +493,40 @@ index f47c7ac..384c812 100644
        throw new Error(
          `Render failed at segment "${segment.id}", action ${result.actionIndex}: ${result.error}`
        );
-@@ -223,7 +260,6 @@ async function render(
+@@ -216,6 +254,32 @@ async function render(
+     console.log(` ${(result.durationMs / 1000).toFixed(1)}s`);
+   }
+ 
++  // Outro card (same look as the title card, shown at the end).
++  let outroDurationMs = 0;
++  if (playbook.outro) {
++    const oc = playbook.outro;
++    outroDurationMs = oc.duration;
++    const isDark = playbook.app.colorScheme === "dark";
++    const bg = isDark ? "#1a1a2e" : "#f5f5f5";
++    const fg = isDark ? "#e0e0e0" : "#1a1a1a";
++    const subtitleColor = isDark ? "#a0a0b0" : "#666666";
++    const outroHtml = `<!DOCTYPE html>
++<html><head><meta charset="utf-8"><style>
++  * { margin: 0; padding: 0; box-sizing: border-box; }
++  body { width: 100vw; height: 100vh; display: flex; flex-direction: column;
++    align-items: center; justify-content: center; background: ${bg}; color: ${fg};
++    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
++  h1 { font-size: 4rem; font-weight: 700; text-align: center; line-height: 1.2; }
++  p  { font-size: 1.8rem; font-weight: 400; margin-top: 1rem; color: ${subtitleColor}; text-align: center; }
++</style></head><body>
++  <h1>${escapeHtml(oc.title)}</h1>
++  ${oc.subtitle ? `<p>${escapeHtml(oc.subtitle)}</p>` : ""}
++</body></html>`;
++    console.log("  Recording outro card...");
++    await page.goto(`data:text/html;charset=utf-8,${encodeURIComponent(outroHtml)}`, { waitUntil: "load" });
++    await new Promise(r => setTimeout(r, outroDurationMs));
++  }
++
+   // Stop screencast and wait for pending frame writes
+   await cdp.send("Page.stopScreencast");
+   while (pendingWrites > 0) {
+@@ -223,7 +287,6 @@ async function render(
    }
    await cdp.detach();
    await context.close();
@@ -333,8 +534,88 @@ index f47c7ac..384c812 100644
  
    // Save video durations back to playbook
    savePlaybook(playbookPath, playbook);
+@@ -238,7 +301,7 @@ async function render(
+   // The expected total duration lets us hold the last frame long enough to
+   // cover static segments where the screencast sends no new frames.
+   const expectedTotalSec =
+-    (preSegmentDurationMs + segmentTimings.reduce((s, t) => s + t.durationMs, 0)) / 1000;
++    (preSegmentDurationMs + segmentTimings.reduce((s, t) => s + t.durationMs, 0) + outroDurationMs) / 1000;
+ 
+   const concatFilePath = path.join(framesDir, "frames.txt");
+   let concatContent = "";
+@@ -257,15 +320,39 @@ async function render(
+   fs.writeFileSync(concatFilePath, concatContent);
+ 
+   const videoPath = path.join(outputDir, `${playbookName}-video.mp4`);
++
++  // Optional window framing: scale the content onto a padded background with a
++  // soft drop shadow (Screen Studio look). Built as a filter_complex.
++  const framingArgs: string[] = [];
++  const fr = playbook.polish?.framing;
++  if (fr?.enabled) {
++    const W = scaledWidth, H = scaledHeight;
++    const p = fr.padding;
++    const cw = Math.round(W * (1 - 2 * p) / 2) * 2;   // even
++    const ch = Math.round(H * (1 - 2 * p) / 2) * 2;
++    const ox = Math.round((W - cw) / 2), oy = Math.round((H - ch) / 2);
++    const filter = fr.shadow
++      ? `[0:v]scale=${cw}:${ch}[c];` +
++        `color=c=${fr.background}:s=${W}x${H}[bg];` +
++        `color=c=black:s=${cw + 40}x${ch + 40}[ss];[ss]boxblur=18:1,format=rgba,colorchannelmixer=aa=0.45[sh];` +
++        `[bg][sh]overlay=${ox - 20}:${oy - 20 + 22}[bg2];` +
++        `[bg2][c]overlay=${ox}:${oy}:format=auto,format=yuv420p[out]`
++      : `[0:v]scale=${cw}:${ch}[c];` +
++        `color=c=${fr.background}:s=${W}x${H}[bg];` +
++        `[bg][c]overlay=${ox}:${oy}:format=auto,format=yuv420p[out]`;
++    framingArgs.push("-filter_complex", filter, "-map", "[out]");
++  }
++
+   await execa("ffmpeg", [
+     "-y",
+     "-f", "concat",
+     "-safe", "0",
+     "-i", concatFilePath,
+     "-r", String(playbook.recording.fps),
++    ...framingArgs,
+     "-c:v", "libx264",
+     "-crf", "17",
+-    "-preset", "slow",
++    "-preset", fr?.enabled ? "medium" : "slow",
+     "-pix_fmt", "yuv420p",
+     videoPath,
+   ]);
+@@ -277,17 +364,23 @@ async function render(
+   console.log("\nMerging audio and video...");
+   const finalOutput = outputPath ?? path.join(outputDir, `${playbookName}.mp4`);
+ 
++  const mergeSegments = playbook.segments.map((s, i) => ({
++    id: s.id,
++    audioPath: audioResults[i].audioPath,
++    audioDurationMs: s.audioDuration!,
++    videoDurationMs: segmentTimings[i].durationMs,
++  }));
++  if (outroDurationMs > 0) {
++    mergeSegments.push({ id: "outro", audioPath: null, audioDurationMs: 0, videoDurationMs: outroDurationMs });
++  }
++
+   await mergeAudioVideo({
+     videoPath,
+-    segments: playbook.segments.map((s, i) => ({
+-      id: s.id,
+-      audioPath: audioResults[i].audioPath,
+-      audioDurationMs: s.audioDuration!,
+-      videoDurationMs: segmentTimings[i].durationMs,
+-    })),
++    segments: mergeSegments,
+     outputPath: finalOutput,
+     outputDir,
+     preSegmentDurationMs,
++    music: playbook.polish?.music,
+   });
+ 
+   // Clean up intermediate video
 diff --git a/src/schema.ts b/src/schema.ts
-index c10352f..96ec613 100644
+index c10352f..d0aeb53 100644
 --- a/src/schema.ts
 +++ b/src/schema.ts
 @@ -5,6 +5,7 @@ import { z } from "zod";
@@ -362,7 +643,46 @@ index c10352f..96ec613 100644
    done: DoneConditionSchema.optional(),
  });
  
-@@ -127,9 +129,10 @@ const PlaybookSchema = z.object({
+@@ -111,10 +113,38 @@ const TitleCardSchema = z.object({
+   duration: z.number().positive().default(3000),
+ });
+ 
++// ─── Polish (optional post/capture effects) ──────────
++
++const PolishSchema = z.object({
++  // Cinematic zoom: ease the page toward the element being acted on.
++  zoom: z.object({
++    enabled: z.boolean().default(false),
++    scale: z.number().min(1).max(3).default(1.35),
++  }).default({}),
++  // Window framing: scale the content onto a padded background with shadow.
++  framing: z.object({
++    enabled: z.boolean().default(false),
++    background: z.string().default("#e9e9ee"),
++    padding: z.number().min(0).max(0.3).default(0.05),
++    radius: z.number().min(0).default(28),
++    shadow: z.boolean().default(true),
++  }).default({}),
++  // (Idle "speed-up" is achieved by using smart `done: { stable }` waits so a
++  //  segment ends as soon as the page settles — no manual fixed waits, no dead
++  //  time. See references/gotchas.md. No frame-compression needed.)
++  // Background music bed, ducked under the narration.
++  music: z.object({
++    file: z.string(),
++    volume: z.number().min(0).max(1).default(0.12),
++  }).optional(),
++}).default({});
++
+ // ─── Playbook ────────────────────────────────────────
+ 
+ const PlaybookSchema = z.object({
+   titleCard: TitleCardSchema.optional(),
++  outro: TitleCardSchema.optional(),
++  polish: PolishSchema,
+   app: z.object({
+     url: z.string().url(),
+     viewport: z.object({
+@@ -127,9 +157,10 @@ const PlaybookSchema = z.object({
      setup: z.array(SetupStepSchema).optional(),
    }),
    tts: z.object({
