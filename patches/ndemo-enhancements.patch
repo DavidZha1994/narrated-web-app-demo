@@ -225,7 +225,7 @@ index cb5a69b..41f0d43 100644
 +
 +export { injectCursor, pointAt, clickEffect, hideCursor, zoomTo, zoomReset };
 diff --git a/src/executor.ts b/src/executor.ts
-index 22b5d2f..a5b8622 100644
+index 22b5d2f..e4e4675 100644
 --- a/src/executor.ts
 +++ b/src/executor.ts
 @@ -2,12 +2,25 @@ import type { Page } from "playwright";
@@ -305,7 +305,7 @@ index 22b5d2f..a5b8622 100644
    audioDurationMs?: number;
    playAudio?: () => { kill: () => void; promise: Promise<unknown> };
    onActionStart?: (action: Action, index: number) => void;
-@@ -127,13 +157,28 @@ async function runSegment(
+@@ -127,13 +157,38 @@ async function runSegment(
      }
    }
  
@@ -313,21 +313,31 @@ index 22b5d2f..a5b8622 100644
 +  // toward the segment's content anchor and hold. Anchor = the first
 +  // type/select (the content focus, e.g. the chat input), else the first
 +  // non-link click (skip "New Chat" and other nav links). -1 = no zoom.
++  // Only zoom on segments with a `type` action (the chat input — a reliable,
++  // centered content anchor). Menu/list segments stay at the full view, which
++  // avoids zooming toward a trigger button while the real content is elsewhere.
 +  let zoomIdx = -1;
 +  if (options.zoom) {
 +    await zoomReset(page);
-+    zoomIdx = segment.actions.findIndex(a => (a.type === "type" || a.type === "select") && a.target);
-+    if (zoomIdx === -1) {
-+      zoomIdx = segment.actions.findIndex(a => a.type === "click" && a.target && a.target.role !== "link");
-+    }
++    zoomIdx = segment.actions.findIndex(a => a.type === "type" && a.target);
 +  }
 +
    // Execute actions
++  let zoomActive = false;
    for (let i = 0; i < segment.actions.length; i++) {
      const action = segment.actions[i];
      options.onActionStart?.(action, i);
  
++    // Release the zoom (ease back to the full view) before a long "viewing"
++    // wait — e.g. while the answer streams in — so the result is shown in
++    // full, not cropped by the punch-in.
++    if (zoomActive && action.type === "wait" && (action.duration ?? 0) >= 4000) {
++      await zoomReset(page);
++      zoomActive = false;
++    }
++
 +    const zoomThis = i === zoomIdx ? options.zoom : undefined;
++    if (zoomThis) zoomActive = true;
 +
      try {
 -      await executeAction(page, action, { cursor: options.cursor });
