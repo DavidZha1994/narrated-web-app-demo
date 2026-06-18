@@ -1,0 +1,29 @@
+# Optional login-intro segment, rendered LOGGED OUT (move auth.json aside first
+# — see references/authenticated-apps.md), then concatenated before the main demo.
+# Shows the login screen and moves the cursor to the SSO button. It does NOT
+# click through to the identity provider and never films credentials.
+
+app:
+  url: https://your-app.example.com/
+  viewport: { width: 1920, height: 1080 }
+  scale: 2
+  zoom: 1.0
+  colorScheme: light
+
+tts:
+  provider: openai
+  voice: alloy
+  speed: 1.0
+  language: English
+
+recording: { outputDir: ".", fps: 30 }
+
+segments:
+  - id: login
+    narration: "Access is protected by single sign-on — one click and you're securely signed in, with all data staying in-house."
+    intent: "show the login page and move the cursor to the SSO button without navigating away"
+    timing: parallel
+    actions:
+      - { type: wait,  duration: 2000 }
+      - { type: hover, target: { role: button, name: "Continue with SSO" } }
+      - { type: wait,  duration: 3000 }

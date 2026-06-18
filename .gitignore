@@ -1,0 +1,25 @@
+# Secrets & auth — NEVER commit
+*.env
+.env*
+auth.json
+.ndemo/
+**/browser-profile/
+*.local.yaml
+*.local.yml
+secrets/
+
+# Build / deps
+node_modules/
+dist/
+.frames/
+
+# Rendered media & generated audio
+*.mp4
+*.mov
+*.webm
+*.srt
+audio/
+video-raw/
+
+# OS
+.DS_Store

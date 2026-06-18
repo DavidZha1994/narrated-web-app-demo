@@ -1,0 +1,128 @@
+# Narrated web-app demo — template playbook.
+# Copy to demo/<name>/<name>.yaml, then fill URLs, narration, and actions.
+# Patterns here encode the lessons in references/gotchas.md.
+
+titleCard:
+  title: "Your App"
+  subtitle: "A quick tour"
+  duration: 3000
+
+app:
+  url: https://your-app.example.com/          # <-- the app under test
+  viewport: { width: 1920, height: 1080 }
+  scale: 2                                      # device scale → 4K output (1920*2)
+  zoom: 1.0
+  colorScheme: light
+  # Optional: deterministic starting state. Only add once you can log in,
+  # otherwise it will fail on the login page and kill the daemon.
+  setup:
+    - { type: click,  target: { role: button, name: "Selected model:" } }
+    - { type: wait,   duration: 800 }
+    - { type: click,  target: { role: option, name: "Select base-model" } }
+    - { type: wait,   duration: 800 }
+
+tts:
+  provider: openai        # openai | elevenlabs | minimax
+  voice: alloy            # e.g. alloy (openai), Calm_Woman (minimax)
+  speed: 1.0
+  language: English       # used by minimax language_boost
+
+recording: { outputDir: ".", fps: 30 }
+
+segments:
+  # Static opener — narration plays over the start page.
+  - id: intro
+    narration: "Welcome to a short tour of our app. Everything runs on our own infrastructure."
+    intent: "show the clean start page"
+    timing: parallel
+    actions:
+      - { type: wait, duration: 2000 }
+
+  # Type + send a question; fixed wait sized to the response time.
+  - id: basic-chat
+    narration: "Let's ask a question. The answer streams in directly in the chat."
+    intent: "type a question and show the streaming answer"
+    timing: parallel
+    actions:
+      - { type: click, target: { selector: "#chat-input" } }
+      - { type: type,  target: { selector: "#chat-input" }, text: "Your example question here", delay: 35 }
+      - { type: wait,  duration: 300 }
+      - { type: press, key: "Enter" }
+      - { type: wait,  duration: 9000 }       # tune to observed response time
+
+  # Toggle a feature in a menu, then use it.
+  - id: feature-toggle
+    narration: "We can enable extra capabilities, like web search, from this menu."
+    intent: "open the tools menu, enable a feature, send a query"
+    timing: parallel
+    actions:
+      - { type: click, target: { role: link, name: "New Chat" } }
+      - { type: wait,  duration: 800 }
+      - { type: click, target: { selector: "#some-menu-button" } }   # use page-state to find the real id
+      - { type: wait,  duration: 800 }
+      - { type: click, target: { role: button, name: "Some Feature" } }
+      - { type: wait,  duration: 700 }
+      - { type: click, target: { selector: "#chat-input" } }
+      - { type: type,  target: { selector: "#chat-input" }, text: "A query that needs the feature", delay: 30 }
+      - { type: wait,  duration: 300 }
+      - { type: press, key: "Enter" }
+      - { type: wait,  duration: 16000 }       # streaming feature → fixed wait, NOT done:{text}
+
+  # Upload a real document, then ask about it (RAG / citations).
+  - id: upload-doc
+    narration: "We can also give the app our own documents and ask questions about them."
+    intent: "upload a file and ask a question about it"
+    timing: parallel
+    actions:
+      - { type: click,  target: { role: link, name: "New Chat" } }
+      - { type: wait,   duration: 800 }
+      - { type: click,  target: { selector: "#attach-menu-button" } }
+      - { type: wait,   duration: 1200 }
+      - { type: upload, target: { selector: "input[type=file][multiple]" }, files: ["/ABSOLUTE/path/to/fixtures/doc.md"] }
+      - { type: wait,   duration: 3500 }
+      - { type: click,  target: { selector: "#chat-input" } }
+      - { type: type,   target: { selector: "#chat-input" }, text: "A question answered by the document", delay: 22 }
+      - { type: wait,   duration: 300 }
+      - { type: press,  key: "Enter" }
+      - { type: wait,   duration: 11000 }
+
+  # Choose a value from a native <select> exposed via a config panel (valves).
+  - id: select-option
+    narration: "For complex tasks we can pick a deeper setting from the options."
+    intent: "open settings, choose a different level from the dropdown, save"
+    timing: parallel
+    actions:
+      - { type: click,  target: { role: link, name: "New Chat" } }
+      - { type: wait,   duration: 800 }
+      - { type: click,  target: { selector: "#some-menu-button" } }
+      - { type: wait,   duration: 800 }
+      - { type: click,  target: { selector: ".settings-icon-class" } }   # opens the config panel
+      - { type: wait,   duration: 900 }
+      - { type: select, target: { role: combobox }, option: "high" }     # native <select>
+      - { type: wait,   duration: 1000 }
+      - { type: click,  target: { role: button, name: "Save", exact: true } }
+      - { type: wait,   duration: 1000 }
+      - { type: press,  key: "Escape" }
+      - { type: wait,   duration: 500 }
+      - { type: click,  target: { selector: "#chat-input" } }
+      - { type: type,   target: { selector: "#chat-input" }, text: "A complex question", delay: 22 }
+      - { type: wait,   duration: 300 }
+      - { type: press,  key: "Enter" }
+      - { type: wait,   duration: 15000 }
+
+  # Simple navigation segments.
+  - id: some-page
+    narration: "Here is another part of the app."
+    intent: "navigate to a section"
+    timing: parallel
+    actions:
+      - { type: click, target: { role: link, name: "Some Page" } }
+      - { type: wait,  duration: 3000 }
+
+  - id: conclusion
+    narration: "That was a quick overview. Thanks for watching!"
+    intent: "return to the clean start page"
+    timing: parallel
+    actions:
+      - { type: click, target: { role: link, name: "New Chat" } }
+      - { type: wait,  duration: 2500 }
