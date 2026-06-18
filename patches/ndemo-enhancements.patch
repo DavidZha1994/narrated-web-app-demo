@@ -1,343 +1,425 @@
-src/browser-daemon.ts | 22 ++++++++--------
- src/browser.ts        | 71 +++++++++++++++++++++++++++++++++++++++++----------
- src/cli.ts            | 18 ++++++++++++-
- src/executor.ts       |  9 +++++++
- src/locators.ts       |  3 ++-
- src/renderer.ts       | 42 +++++++++++++++++++++++++++---
- src/schema.ts         |  7 +++--
- src/tts.ts            | 38 +++++++++++++++++++++++++++
- 8 files changed, 179 insertions(+), 31 deletions(-)
-
---- Changes ---
-
-src/browser-daemon.ts
-  @@ -38,25 +38,25 @@ async function main() {
-  -      `--window-size=${playbook.app.viewport.width},${playbook.app.viewport.height}`,
-  -      `--force-device-scale-factor=1`,
-  -      "--high-dpi-support=1",
-  +      // Fit the user's screen and use the Mac's native Retina DPR instead of
-  +      // forcing a fixed 1920x1080 window at scale 1 (which renders oversized
-  +      // and non-Retina on a MacBook display). The render pipeline keeps its
-  +      // own high-res viewport, independent of this interactive window.
-  +      "--start-maximized",
-         "--enable-gpu-rasterization",
-  -      "--disable-lcd-text",
-  -      "--font-render-hinting=medium",
-         "--disable-default-apps",
-         "--no-first-run",
-         "--disable-infobars",
-         "--disable-translate",
-  +      "--disable-notifications",
-  +      "--disable-save-password-bubble",
-         "--disable-sync",
-  -      "--disable-features=ChromeWhatsNewUI,MediaRouter",
-  +      "--disable-features=Translate,TranslateUI,ChromeWhatsNewUI,MediaRouter,PasswordManagerOnboarding,AutofillServerCommunication",
-         ...zoomExtensionArgs(),
-       ],
-  -    viewport: {
-  -      width: playbook.app.viewport.width,
-  -      height: playbook.app.viewport.height,
-  -    },
-  -    deviceScaleFactor: 1,
-  +    // viewport: null → use the real (maximized) window size at the display's
-  +    // native device pixel ratio, so the window is crisp on Retina.
-  +    viewport: null,
-       colorScheme: playbook.app.colorScheme,
-       locale: "en-US",
-     });
-  +11 -11
-
-src/browser.ts
-  @@ -60,8 +60,8 @@ async function open(playbookPath: string): Promise<void> {
-  -    // Dead process, clean up
-  -    fs.rmSync(INFO_DIR, { recursive: true });
-  +    // Dead process, clean up only the stale info file (keep profile/auth).
-  +    fs.rmSync(INFO_PATH, { force: true });
-     }
-   
-     const daemonScript = path.join(__dirname, "browser-daemon.js");
-  @@ -138,7 +138,7 @@ async function connect(): Promise<BrowserConnection> {
-  -    fs.rmSync(INFO_DIR, { recursive: true });
-  +    fs.rmSync(INFO_PATH, { force: true });
-       throw new Error(
-         "Browser daemon is dead. Run `ndemo open <playbook.yaml>` again."
-       );
-  @@ -161,22 +161,67 @@ async function close(): Promise<void> {
-  -  // Kill the daemon process tree — this takes down both the node
-  -  // daemon and the Chromium process it spawned.
-  -  killProcessTree(info.pid);
-  -
-  -  // Wait briefly for processes to die, then verify
-  -  await new Promise(r => setTimeout(r, 500));
-  +  // Graceful shutdown first: SIGTERM lets the daemon's handler call
-  +  // context.close(), which flushes localStorage (e.g. the OpenWebUI auth
-  +  // token) and cookies to the profile on disk. A hard SIGKILL would lose
-  +  // unflushed localStorage and log the user out.
-  +  try { process.kill(info.pid, "SIGTERM"); } catch {}
-   
-  +  // Wait up to ~4s for graceful exit.
-  +  for (let i = 0; i < 8 && isProcessAlive(info.pid); i++) {
-  +    await new Promise(r => setTimeout(r, 500));
-  +  }
-     if (isProcessAlive(info.pid)) {
-  -    // Last resort: SIGKILL directly
-  -    try { process.kill(info.pid, "SIGKILL"); } catch {}
-  +    // Last resort: hard kill the process tree.
-  +    killProcessTree(info.pid);
-  +    await new Promise(r => setTimeout(r, 500));
-  +    if (isProcessAlive(info.pid)) {
-  +      try { process.kill(info.pid, "SIGKILL"); } catch {}
-  +    }
-     }
-   
-  -  fs.rmSync(INFO_DIR, { recursive: true });
-  +  // Only remove the daemon info file — KEEP the browser profile and
-  +  // auth.json so login persists across daemon restarts and renders.
-  +  fs.rmSync(INFO_PATH, { force: true });
-     console.log("Browser closed.");
-   }
-   
-  +/**
-  + * Capture cookies + localStorage from the live daemon session into a
-  + * storageState JSON file, so a later headless render can restore the
-  + * login even though `close` SIGKILLs Chromium (which loses unflushed
-  + * localStorage, e.g. the OpenWebUI auth token).
-  + */
-  +async function captureAuth(outPath = path.join(INFO_DIR, "auth.json")): Promise<void> {
-  +  const { page } = await connect();
-  +  const state = await page.context().storageState();
-  +
-  +  // storageState() over a CDP connection often misses localStorage, where
-  +  // OpenWebUI keeps its auth token. Read it directly from the page and merge
-  +  // it into the storageState origins so the render can restore the session.
-  +  const origin = new URL(page.url()).origin;
-  +  const ls = await page.evaluate(() => {
-  +    const out: Record<string, string> = {};
-  +    for (let i = 0; i < localStorage.length; i++) {
-  +      const k = localStorage.key(i);
-  +      if (k) out[k] = localStorage.getItem(k) ?? "";
-  +    }
-  +    return out;
-  +  });
-  +  const lsItems = Object.entries(ls).map(([name, value]) => ({ name, value }));
-  +  if (lsItems.length) {
-  +    const existing = (state.origins ?? []).find(o => o.origin === origin);
-  +    if (existing) existing.localStorage = lsItems;
-  +    else (state.origins ??= []).push({ origin, localStorage: lsItems });
-  +  }
-  +
-  +  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  +  fs.writeFileSync(outPath, JSON.stringify(state, null, 2));
-  +  const originCount = state.origins?.length ?? 0;
-  +  const lsCount = state.origins?.reduce((n, o) => n + (o.localStorage?.length ?? 0), 0) ?? 0;
-  +  console.log(`Auth captured to ${outPath} (${state.cookies.length} cookies, ${originCount} origins, ${lsCount} localStorage items)`);
-  +}
-  +
-   async function reset(): Promise<void> {
-     const { page } = await connect();
-     const info: BrowserInfo = JSON.parse(fs.readFileSync(INFO_PATH, "utf-8"));
-  @@ -191,5 +236,5 @@ async function reset(): Promise<void> {
-  -export { open, connect, close, reset };
-  +export { open, connect, close, reset, captureAuth };
-   export type { BrowserInfo, BrowserConnection };
-  +58 -13
-
-src/cli.ts
-  @@ -1,7 +1,7 @@
-  -import { open, close, reset } from "./browser.js";
-  +import { open, close, reset, captureAuth } from "./browser.js";
-   import { connect } from "./browser.js";
-   import { readPageState } from "./page-reader.js";
-   import { play } from "./player.js";
-  @@ -50,6 +50,22 @@ program
-  +// ─── capture-auth ────────────────────────────────────
-  +
-  +program
-  +  .command("capture-auth")
-  +  .description("Save the live daemon session (cookies + localStorage) to .ndemo/auth.json for headless render login")
-  +  .option("--output <path>", "Output path for storageState JSON")
-  +  .action(async (options: { output?: string }) => {
-  +    try {
-  +      await captureAuth(options.output);
-  +      process.exit(0);
-  +    } catch (err) {
-  +      console.error(`Error: ${err}`);
-  +      process.exit(1);
-  +    }
-  +  });
-  +
-   // ─── reset ───────────────────────────────────────────
-   
-   program
-  +17 -1
-
-src/executor.ts
-  @@ -22,6 +22,15 @@ async function executeAction(
-  +  if (action.type === "upload") {
-  +    // Set files directly on the (often hidden) <input type=file>,
-  +    // bypassing the OS file chooser. No cursor pointing for hidden inputs.
-  +    const input = toLocator(page, action.target!);
-  +    await input.setInputFiles(action.files!);
-  +    if (action.done) await waitForDone(page, action.done);
-  +    return;
-  +  }
-  +
-     const locator = toLocator(page, action.target!);
-   
-     if (showCursor && (action.type === "click" || action.type === "type"
-  +9 -0
-
-src/locators.ts
-  @@ -3,8 +3,9 @@ import type { Target } from "./schema.js";
-  -    const opts: Record<string, string> = {};
-  +    const opts: Record<string, unknown> = {};
-       if (target.name) opts.name = target.name;
-  +    if (target.exact != null) opts.exact = target.exact;
-       return page.getByRole(target.role as any, opts);
-     }
-     if (target.label) return page.getByLabel(target.label);
-  +2 -1
-
-src/renderer.ts
-  @@ -75,11 +75,24 @@ async function render(
-  -  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ndemo-render-"));
-  +  // Reuse the daemon's persistent profile so login/session (e.g. SSO cookies)
-  +  // established during `open` carry over into the headless render.
-  +  const userDataDir = path.resolve(".ndemo", "browser-profile");
-  +  fs.mkdirSync(userDataDir, { recursive: true });
-     const context = await chromium.launchPersistentContext(userDataDir, {
-       headless: false,
-       args: [
-         "--headless=new",
-  +      // Suppress browser chrome/popups that must never appear in the recording
-  +      // (translate bar, save-password bubble, notifications, info bars, etc.).
-  +      "--disable-translate",
-  +      "--disable-infobars",
-  +      "--disable-notifications",
-  +      "--disable-save-password-bubble",
-  +      "--disable-default-apps",
-  +      "--no-first-run",
-  +      "--disable-sync",
-  +      "--disable-features=Translate,TranslateUI,ChromeWhatsNewUI,MediaRouter,PasswordManagerOnboarding,AutofillServerCommunication",
-         ...zoomExtensionArgs(),
-       ],
-       viewport: { width: scaledWidth, height: scaledHeight },
-  @@ -93,12 +106,37 @@ async function render(
-  +  // Restore login from a captured storageState (see `ndemo capture-auth`).
-  +  // `close` SIGKILLs Chromium, which loses unflushed localStorage (e.g. the
-  +  // OpenWebUI auth token), so seed cookies + localStorage explicitly here.
-  +  const authPath = path.resolve(".ndemo", "auth.json");
-  +  if (fs.existsSync(authPath)) {
-  +    const auth = JSON.parse(fs.readFileSync(authPath, "utf-8"));
-  +    if (auth.cookies?.length) await context.addCookies(auth.cookies);
-  +    for (const origin of auth.origins ?? []) {
-  +      const items = origin.localStorage ?? [];
-  +      await context.addInitScript((args: { origin: string; items: { name: string; value: string }[] }) => {
-  +        if (location.origin === args.origin) {
-  +          for (const { name, value } of args.items) {
-  +            try { localStorage.setItem(name, value); } catch {}
-  +          }
-  +        }
-  +      }, { origin: origin.origin, items });
-  +    }
-  +    console.log(`  Restored auth from ${authPath}.`);
-  +  }
-  +
-     const page = context.pages()[0] || await context.newPage();
-   
-     // Navigate to app and apply real browser zoom (needs an HTTP page for
-     // the extension content script). Zoom persists across navigations.
-     let startUrl = playbook.app.url;
-     await page.goto(playbook.app.url, { waitUntil: "load" });
-  +  // localStorage seeded via addInitScript only takes effect after a load on
-  +  // the target origin; reload so the app boots already authenticated.
-  +  if (fs.existsSync(authPath)) {
-  +    await page.reload({ waitUntil: "load" });
-  +  }
-     await setBrowserZoom(page, zoomPercent);
-   
-     if (playbook.app.setup) {
-  @@ -201,7 +239,6 @@ async function render(
-  -      fs.rmSync(userDataDir, { recursive: true, force: true });
-         throw new Error(
-           `Render failed at segment "${segment.id}", action ${result.actionIndex}: ${result.error}`
-         );
-  @@ -223,7 +260,6 @@ async function render(
-  -  fs.rmSync(userDataDir, { recursive: true, force: true });
-   
-     // Save video durations back to playbook
-     savePlaybook(playbookPath, playbook);
-  +39 -3
-
-src/schema.ts
-  @@ -5,6 +5,7 @@ import { z } from "zod";
-  +  exact: z.boolean().optional(),
-     label: z.string().optional(),
-     text: z.string().optional(),
-     placeholder: z.string().optional(),
-  @@ -54,7 +55,7 @@ const ConditionSchema = z.object({
-  -    "wait", "select", "press"
-  +    "wait", "select", "press", "upload"
-     ]),
-     target: TargetSchema.optional(),
-     text: z.string().optional(),
-  @@ -62,6 +63,7 @@ const ActionBaseSchema = z.object({
-  +  files: z.array(z.string()).optional(),
-     done: DoneConditionSchema.optional(),
+diff --git a/src/browser-daemon.ts b/src/browser-daemon.ts
+index fedd313..6949641 100644
+--- a/src/browser-daemon.ts
++++ b/src/browser-daemon.ts
+@@ -38,25 +38,25 @@ async function main() {
+     headless: false,
+     args: [
+       `--remote-debugging-port=${debugPort}`,
+-      `--window-size=${playbook.app.viewport.width},${playbook.app.viewport.height}`,
+-      `--force-device-scale-factor=1`,
+-      "--high-dpi-support=1",
++      // Fit the user's screen and use the Mac's native Retina DPR instead of
++      // forcing a fixed 1920x1080 window at scale 1 (which renders oversized
++      // and non-Retina on a MacBook display). The render pipeline keeps its
++      // own high-res viewport, independent of this interactive window.
++      "--start-maximized",
+       "--enable-gpu-rasterization",
+-      "--disable-lcd-text",
+-      "--font-render-hinting=medium",
+       "--disable-default-apps",
+       "--no-first-run",
+       "--disable-infobars",
+       "--disable-translate",
++      "--disable-notifications",
++      "--disable-save-password-bubble",
+       "--disable-sync",
+-      "--disable-features=ChromeWhatsNewUI,MediaRouter",
++      "--disable-features=Translate,TranslateUI,ChromeWhatsNewUI,MediaRouter,PasswordManagerOnboarding,AutofillServerCommunication",
+       ...zoomExtensionArgs(),
+     ],
+-    viewport: {
+-      width: playbook.app.viewport.width,
+-      height: playbook.app.viewport.height,
+-    },
+-    deviceScaleFactor: 1,
++    // viewport: null → use the real (maximized) window size at the display's
++    // native device pixel ratio, so the window is crisp on Retina.
++    viewport: null,
+     colorScheme: playbook.app.colorScheme,
+     locale: "en-US",
    });
-   
-  @@ -127,9 +129,10 @@ const PlaybookSchema = z.object({
-  -    provider: z.enum(["openai", "elevenlabs"]).default("openai"),
-  +    provider: z.enum(["openai", "elevenlabs", "minimax"]).default("openai"),
-       voice: z.string().default("alloy"),
-       speed: z.number().positive().default(1.0),
-  +    language: z.string().optional(),
-     }).default({}),
-     recording: z.object({
-       outputDir: z.string().default("."),
-  +5 -2
-
-src/tts.ts
-  @@ -81,6 +81,44 @@ async function ensureAudio(
-  +  } else if (playbook.tts.provider === "minimax") {
-  +    const apiKey = process.env.MINIMAX_API_KEY;
-  +    if (!apiKey) {
-  +      throw new Error("MINIMAX_API_KEY environment variable not set");
-  +    }
-  +    const resp = await fetch("https://api.minimax.chat/v1/t2a_v2", {
-  +      method: "POST",
-  +      headers: {
-  +        "Authorization": `Bearer ${apiKey}`,
-  +        "Content-Type": "application/json",
-  +      },
-  +      body: JSON.stringify({
-  +        model: "speech-02-hd",
-  +        text: segment.narration!,
-  +        stream: false,
-  +        voice_setting: {
-  +          voice_id: playbook.tts.voice,
-  +          speed: playbook.tts.speed,
-  +          vol: 1.0,
-  +          pitch: 0,
-  +        },
-  +        audio_setting: {
-  +          format: "mp3",
-  +          sample_rate: 32000,
-  +          bitrate: 128000,
-  +          channel: 1,
-  +        },
-  +        language_boost: playbook.tts.language || "German",
-  +      }),
-  +    });
-  +    const data: any = await resp.json();
-  +    const hex = data?.data?.audio;
-  +    if (!hex) {
-  +      throw new Error("MiniMax TTS failed: " + JSON.stringify(data).slice(0, 300));
-  +    }
-  +    const isHex = /^[0-9a-fA-F]+$/.test(hex);
-  +    const buf = isHex ? Buffer.from(hex, "hex") : Buffer.from(hex, "base64");
-  +    fs.writeFileSync(audioPath, new Uint8Array(buf));
-     } else {
-       throw new Error(`TTS provider "${playbook.tts.provider}" not yet implemented`);
+diff --git a/src/browser.ts b/src/browser.ts
+index 17f0f74..38c4be2 100644
+--- a/src/browser.ts
++++ b/src/browser.ts
+@@ -60,8 +60,8 @@ async function open(playbookPath: string): Promise<void> {
+       console.log(`Browser daemon already running (PID ${existing.pid}). Use \`ndemo close\` first.`);
+       return;
      }
-  +38 -0
+-    // Dead process, clean up
+-    fs.rmSync(INFO_DIR, { recursive: true });
++    // Dead process, clean up only the stale info file (keep profile/auth).
++    fs.rmSync(INFO_PATH, { force: true });
+   }
+ 
+   const daemonScript = path.join(__dirname, "browser-daemon.js");
+@@ -138,7 +138,7 @@ async function connect(): Promise<BrowserConnection> {
+   const info: BrowserInfo = JSON.parse(fs.readFileSync(INFO_PATH, "utf-8"));
+ 
+   if (!isProcessAlive(info.pid)) {
+-    fs.rmSync(INFO_DIR, { recursive: true });
++    fs.rmSync(INFO_PATH, { force: true });
+     throw new Error(
+       "Browser daemon is dead. Run `ndemo open <playbook.yaml>` again."
+     );
+@@ -161,22 +161,67 @@ async function close(): Promise<void> {
+ 
+   const info: BrowserInfo = JSON.parse(fs.readFileSync(INFO_PATH, "utf-8"));
+ 
+-  // Kill the daemon process tree — this takes down both the node
+-  // daemon and the Chromium process it spawned.
+-  killProcessTree(info.pid);
+-
+-  // Wait briefly for processes to die, then verify
+-  await new Promise(r => setTimeout(r, 500));
++  // Graceful shutdown first: SIGTERM lets the daemon's handler call
++  // context.close(), which flushes localStorage (e.g. the OpenWebUI auth
++  // token) and cookies to the profile on disk. A hard SIGKILL would lose
++  // unflushed localStorage and log the user out.
++  try { process.kill(info.pid, "SIGTERM"); } catch {}
+ 
++  // Wait up to ~4s for graceful exit.
++  for (let i = 0; i < 8 && isProcessAlive(info.pid); i++) {
++    await new Promise(r => setTimeout(r, 500));
++  }
+   if (isProcessAlive(info.pid)) {
+-    // Last resort: SIGKILL directly
+-    try { process.kill(info.pid, "SIGKILL"); } catch {}
++    // Last resort: hard kill the process tree.
++    killProcessTree(info.pid);
++    await new Promise(r => setTimeout(r, 500));
++    if (isProcessAlive(info.pid)) {
++      try { process.kill(info.pid, "SIGKILL"); } catch {}
++    }
+   }
+ 
+-  fs.rmSync(INFO_DIR, { recursive: true });
++  // Only remove the daemon info file — KEEP the browser profile and
++  // auth.json so login persists across daemon restarts and renders.
++  fs.rmSync(INFO_PATH, { force: true });
+   console.log("Browser closed.");
+ }
+ 
++/**
++ * Capture cookies + localStorage from the live daemon session into a
++ * storageState JSON file, so a later headless render can restore the
++ * login even though `close` SIGKILLs Chromium (which loses unflushed
++ * localStorage, e.g. the OpenWebUI auth token).
++ */
++async function captureAuth(outPath = path.join(INFO_DIR, "auth.json")): Promise<void> {
++  const { page } = await connect();
++  const state = await page.context().storageState();
++
++  // storageState() over a CDP connection often misses localStorage, where
++  // OpenWebUI keeps its auth token. Read it directly from the page and merge
++  // it into the storageState origins so the render can restore the session.
++  const origin = new URL(page.url()).origin;
++  const ls = await page.evaluate(() => {
++    const out: Record<string, string> = {};
++    for (let i = 0; i < localStorage.length; i++) {
++      const k = localStorage.key(i);
++      if (k) out[k] = localStorage.getItem(k) ?? "";
++    }
++    return out;
++  });
++  const lsItems = Object.entries(ls).map(([name, value]) => ({ name, value }));
++  if (lsItems.length) {
++    const existing = (state.origins ?? []).find(o => o.origin === origin);
++    if (existing) existing.localStorage = lsItems;
++    else (state.origins ??= []).push({ origin, localStorage: lsItems });
++  }
++
++  fs.mkdirSync(path.dirname(outPath), { recursive: true });
++  fs.writeFileSync(outPath, JSON.stringify(state, null, 2));
++  const originCount = state.origins?.length ?? 0;
++  const lsCount = state.origins?.reduce((n, o) => n + (o.localStorage?.length ?? 0), 0) ?? 0;
++  console.log(`Auth captured to ${outPath} (${state.cookies.length} cookies, ${originCount} origins, ${lsCount} localStorage items)`);
++}
++
+ async function reset(): Promise<void> {
+   const { page } = await connect();
+   const info: BrowserInfo = JSON.parse(fs.readFileSync(INFO_PATH, "utf-8"));
+@@ -191,5 +236,5 @@ async function reset(): Promise<void> {
+   console.log(`Reset to ${playbook.app.url}`);
+ }
+ 
+-export { open, connect, close, reset };
++export { open, connect, close, reset, captureAuth };
+ export type { BrowserInfo, BrowserConnection };
+diff --git a/src/cli.ts b/src/cli.ts
+index c389daf..79a5242 100644
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env node
+ 
+ import { Command } from "commander";
+-import { open, close, reset } from "./browser.js";
++import { open, close, reset, captureAuth } from "./browser.js";
+ import { connect } from "./browser.js";
+ import { readPageState } from "./page-reader.js";
+ import { play } from "./player.js";
+@@ -50,6 +50,22 @@ program
+     }
+   });
+ 
++// ─── capture-auth ────────────────────────────────────
++
++program
++  .command("capture-auth")
++  .description("Save the live daemon session (cookies + localStorage) to .ndemo/auth.json for headless render login")
++  .option("--output <path>", "Output path for storageState JSON")
++  .action(async (options: { output?: string }) => {
++    try {
++      await captureAuth(options.output);
++      process.exit(0);
++    } catch (err) {
++      console.error(`Error: ${err}`);
++      process.exit(1);
++    }
++  });
++
+ // ─── reset ───────────────────────────────────────────
+ 
+ program
+diff --git a/src/executor.ts b/src/executor.ts
+index 22b5d2f..5c2cae4 100644
+--- a/src/executor.ts
++++ b/src/executor.ts
+@@ -4,6 +4,19 @@ import { toLocator } from "./locators.js";
+ import { waitForDone } from "./waiters.js";
+ import { pointAt, clickEffect, hideCursor } from "./cursor.js";
+ 
++// Non-fatal readiness wait. A `done` condition that times out or errors must
++// NOT crash the whole render — log and continue. This makes smart waits
++// (done: { stable }, { networkIdle }) safe to use instead of guessed fixed
++// waits: the segment proceeds as soon as the page settles, and a slow/odd
++// response just falls through instead of aborting the render.
++async function awaitDone(page: Page, done: NonNullable<Action["done"]>): Promise<void> {
++  try {
++    await waitForDone(page, done);
++  } catch (err) {
++    console.error(`  (done not met, continuing: ${String(err).split("\n")[0]})`);
++  }
++}
++
+ async function executeAction(
+   page: Page,
+   action: Action,
+@@ -18,7 +31,16 @@ async function executeAction(
+ 
+   if (action.type === "press") {
+     await page.keyboard.press(action.key!);
+-    if (action.done) await waitForDone(page, action.done);
++    if (action.done) await awaitDone(page, action.done);
++    return;
++  }
++
++  if (action.type === "upload") {
++    // Set files directly on the (often hidden) <input type=file>,
++    // bypassing the OS file chooser. No cursor pointing for hidden inputs.
++    const input = toLocator(page, action.target!);
++    await input.setInputFiles(action.files!);
++    if (action.done) await awaitDone(page, action.done);
+     return;
+   }
+ 
+@@ -56,7 +78,7 @@ async function executeAction(
+   }
+ 
+   if (action.done) {
+-    await waitForDone(page, action.done);
++    await awaitDone(page, action.done);
+   }
+ }
+ 
+diff --git a/src/locators.ts b/src/locators.ts
+index 93d61d5..01da713 100644
+--- a/src/locators.ts
++++ b/src/locators.ts
+@@ -3,8 +3,9 @@ import type { Target } from "./schema.js";
+ 
+ function toLocator(page: Page, target: Target): Locator {
+   if (target.role) {
+-    const opts: Record<string, string> = {};
++    const opts: Record<string, unknown> = {};
+     if (target.name) opts.name = target.name;
++    if (target.exact != null) opts.exact = target.exact;
+     return page.getByRole(target.role as any, opts);
+   }
+   if (target.label) return page.getByLabel(target.label);
+diff --git a/src/renderer.ts b/src/renderer.ts
+index f47c7ac..384c812 100644
+--- a/src/renderer.ts
++++ b/src/renderer.ts
+@@ -75,11 +75,24 @@ async function render(
+   const zoomPercent = playbook.app.zoom * playbook.app.scale * 100;
+ 
+   // Extensions require a persistent context and --headless=new.
+-  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ndemo-render-"));
++  // Reuse the daemon's persistent profile so login/session (e.g. SSO cookies)
++  // established during `open` carry over into the headless render.
++  const userDataDir = path.resolve(".ndemo", "browser-profile");
++  fs.mkdirSync(userDataDir, { recursive: true });
+   const context = await chromium.launchPersistentContext(userDataDir, {
+     headless: false,
+     args: [
+       "--headless=new",
++      // Suppress browser chrome/popups that must never appear in the recording
++      // (translate bar, save-password bubble, notifications, info bars, etc.).
++      "--disable-translate",
++      "--disable-infobars",
++      "--disable-notifications",
++      "--disable-save-password-bubble",
++      "--disable-default-apps",
++      "--no-first-run",
++      "--disable-sync",
++      "--disable-features=Translate,TranslateUI,ChromeWhatsNewUI,MediaRouter,PasswordManagerOnboarding,AutofillServerCommunication",
+       ...zoomExtensionArgs(),
+     ],
+     viewport: { width: scaledWidth, height: scaledHeight },
+@@ -93,12 +106,37 @@ async function render(
+     await context.waitForEvent("serviceworker", { timeout: 5000 });
+   }
+ 
++  // Restore login from a captured storageState (see `ndemo capture-auth`).
++  // `close` SIGKILLs Chromium, which loses unflushed localStorage (e.g. the
++  // OpenWebUI auth token), so seed cookies + localStorage explicitly here.
++  const authPath = path.resolve(".ndemo", "auth.json");
++  if (fs.existsSync(authPath)) {
++    const auth = JSON.parse(fs.readFileSync(authPath, "utf-8"));
++    if (auth.cookies?.length) await context.addCookies(auth.cookies);
++    for (const origin of auth.origins ?? []) {
++      const items = origin.localStorage ?? [];
++      await context.addInitScript((args: { origin: string; items: { name: string; value: string }[] }) => {
++        if (location.origin === args.origin) {
++          for (const { name, value } of args.items) {
++            try { localStorage.setItem(name, value); } catch {}
++          }
++        }
++      }, { origin: origin.origin, items });
++    }
++    console.log(`  Restored auth from ${authPath}.`);
++  }
++
+   const page = context.pages()[0] || await context.newPage();
+ 
+   // Navigate to app and apply real browser zoom (needs an HTTP page for
+   // the extension content script). Zoom persists across navigations.
+   let startUrl = playbook.app.url;
+   await page.goto(playbook.app.url, { waitUntil: "load" });
++  // localStorage seeded via addInitScript only takes effect after a load on
++  // the target origin; reload so the app boots already authenticated.
++  if (fs.existsSync(authPath)) {
++    await page.reload({ waitUntil: "load" });
++  }
+   await setBrowserZoom(page, zoomPercent);
+ 
+   if (playbook.app.setup) {
+@@ -201,7 +239,6 @@ async function render(
+       await cdp.send("Page.stopScreencast");
+       await cdp.detach();
+       await context.close();
+-      fs.rmSync(userDataDir, { recursive: true, force: true });
+       throw new Error(
+         `Render failed at segment "${segment.id}", action ${result.actionIndex}: ${result.error}`
+       );
+@@ -223,7 +260,6 @@ async function render(
+   }
+   await cdp.detach();
+   await context.close();
+-  fs.rmSync(userDataDir, { recursive: true, force: true });
+ 
+   // Save video durations back to playbook
+   savePlaybook(playbookPath, playbook);
+diff --git a/src/schema.ts b/src/schema.ts
+index c10352f..96ec613 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -5,6 +5,7 @@ import { z } from "zod";
+ const TargetSchema = z.object({
+   role: z.string().optional(),
+   name: z.string().optional(),
++  exact: z.boolean().optional(),
+   label: z.string().optional(),
+   text: z.string().optional(),
+   placeholder: z.string().optional(),
+@@ -54,7 +55,7 @@ const ConditionSchema = z.object({
+ const ActionBaseSchema = z.object({
+   type: z.enum([
+     "click", "type", "hover", "scroll",
+-    "wait", "select", "press"
++    "wait", "select", "press", "upload"
+   ]),
+   target: TargetSchema.optional(),
+   text: z.string().optional(),
+@@ -62,6 +63,7 @@ const ActionBaseSchema = z.object({
+   delay: z.number().optional(),
+   duration: z.number().optional(),
+   option: z.string().optional(),
++  files: z.array(z.string()).optional(),
+   done: DoneConditionSchema.optional(),
+ });
+ 
+@@ -127,9 +129,10 @@ const PlaybookSchema = z.object({
+     setup: z.array(SetupStepSchema).optional(),
+   }),
+   tts: z.object({
+-    provider: z.enum(["openai", "elevenlabs"]).default("openai"),
++    provider: z.enum(["openai", "elevenlabs", "minimax"]).default("openai"),
+     voice: z.string().default("alloy"),
+     speed: z.number().positive().default(1.0),
++    language: z.string().optional(),
+   }).default({}),
+   recording: z.object({
+     outputDir: z.string().default("."),
+diff --git a/src/tts.ts b/src/tts.ts
+index 3e9ee7d..f7ba59b 100644
+--- a/src/tts.ts
++++ b/src/tts.ts
+@@ -81,6 +81,44 @@ async function ensureAudio(
+ 
+     const arrayBuffer = await response.arrayBuffer();
+     fs.writeFileSync(audioPath, new Uint8Array(arrayBuffer));
++  } else if (playbook.tts.provider === "minimax") {
++    const apiKey = process.env.MINIMAX_API_KEY;
++    if (!apiKey) {
++      throw new Error("MINIMAX_API_KEY environment variable not set");
++    }
++    const resp = await fetch("https://api.minimax.chat/v1/t2a_v2", {
++      method: "POST",
++      headers: {
++        "Authorization": `Bearer ${apiKey}`,
++        "Content-Type": "application/json",
++      },
++      body: JSON.stringify({
++        model: "speech-02-hd",
++        text: segment.narration!,
++        stream: false,
++        voice_setting: {
++          voice_id: playbook.tts.voice,
++          speed: playbook.tts.speed,
++          vol: 1.0,
++          pitch: 0,
++        },
++        audio_setting: {
++          format: "mp3",
++          sample_rate: 32000,
++          bitrate: 128000,
++          channel: 1,
++        },
++        language_boost: playbook.tts.language || "German",
++      }),
++    });
++    const data: any = await resp.json();
++    const hex = data?.data?.audio;
++    if (!hex) {
++      throw new Error("MiniMax TTS failed: " + JSON.stringify(data).slice(0, 300));
++    }
++    const isHex = /^[0-9a-fA-F]+$/.test(hex);
++    const buf = isHex ? Buffer.from(hex, "hex") : Buffer.from(hex, "base64");
++    fs.writeFileSync(audioPath, new Uint8Array(buf));
+   } else {
+     throw new Error(`TTS provider "${playbook.tts.provider}" not yet implemented`);
+   }

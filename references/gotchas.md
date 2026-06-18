@@ -24,9 +24,17 @@ polls a text locator repeatedly. On a page that streams content for 60–90s
 (web search, long generations) this reliably **closes/crashes the headless
 browser** ("Target page, context or browser has been closed").
 
-Fix: use a **fixed `wait`** sized to the observed response time. A 45–55s fixed
-wait records fine; the crash was the polling locator, not the duration. Frames
-are captured on-change, so a static post-response screen adds few frames.
+Fix: use a **fixed `wait`** sized to the observed response time, or a smart
+`done: { stable: 1500, timeout: 30000 }` / `done: { networkIdle: true }` which
+ends as soon as the page settles. A 45–55s fixed wait records fine; the crash
+was the polling locator, not the duration. Frames are captured on-change, so a
+static post-response screen adds few frames.
+
+`done` is **non-fatal** in this patch: if a condition times out or errors, the
+action logs `(done not met, continuing: …)` and the render proceeds, instead of
+aborting. So smart waits are safe to use — worst case they fall through to the
+segment's own fixed-wait bound. (`stable`/`networkIdle` are still preferred over
+`text` on long-streaming pages.)
 
 ## Keep single-column layout centered
 

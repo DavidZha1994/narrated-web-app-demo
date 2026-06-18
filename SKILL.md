@@ -117,6 +117,48 @@ To open the video with the login screen, render a logged-out intro and
 concatenate. See `references/authenticated-apps.md` (the "Recording the login"
 section) and `assets/templates/login-intro.template.yaml`.
 
+## Best practices
+
+**Calibrate waits — don't guess.** For each segment that waits on an async
+response, run it once (`play --segment <id>`) and note how long the response
+actually takes. Then either:
+- set a fixed `wait` a little longer than observed (proven-safe, deterministic), or
+- use a **smart wait** `done: { stable: 1500, timeout: 30000 }` after the
+  send — the segment proceeds as soon as the DOM stops changing for 1.5s, so
+  there is no dead time *and* no under-cutting. `done` is **non-fatal**: a
+  timeout logs and continues instead of crashing the render.
+- Do **not** use `done: { text: ... }` on a page that streams for a long time —
+  the locator polling can crash the headless browser. Prefer `stable` /
+  `networkIdle`, or a fixed wait.
+
+**Trim dead time.** Use `timing: parallel` everywhere; keep narration ~10–15s;
+size waits to the *response*, not a round number. A 90s "searching" shot is
+boring — show enough to prove it works and move on.
+
+**Verify before delivering.** The render is headless, so confirm the result:
+```bash
+ffprobe -v error -show_entries format=duration eva.mp4
+for t in 30 60 100 150; do ffmpeg -y -ss $t -i eva.mp4 -frames:v 1 /tmp/f$t.png; done
+```
+Eyeball one frame per segment — confirm it's logged in, centered, and showing
+the intended content (not a spinner or the wrong screen).
+
+**Render reliably.** `close` the daemon before `render` (they fight over the
+profile). Keep credentials out of the repo (`*.local.yaml`, env vars). If a
+render fails, an `error-<segment>.png` is written to the output dir.
+
+**Polish in post (optional, via ffmpeg).** Background music bed and an outro are
+a post-step, not part of ndemo:
+```bash
+# duck a music bed under the narration
+ffmpeg -i demo.mp4 -i music.mp3 -filter_complex \
+  "[1:a]volume=0.12[m];[0:a][m]amix=inputs=2:duration=first" -c:v copy demo-music.mp4
+```
+
+**Roadmap (not yet built — see README):** cinematic zoom/pan onto the active
+element (the biggest visual gap vs Screen Studio / playwright-recast),
+auto speed-up of idle stretches, and window framing (padding + shadow + background).
+
 ## References
 
 - `references/authenticated-apps.md` — capture/restore auth, scripted SSO login,
