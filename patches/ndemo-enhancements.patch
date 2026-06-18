@@ -225,7 +225,7 @@ index cb5a69b..41f0d43 100644
 +
 +export { injectCursor, pointAt, clickEffect, hideCursor, zoomTo, zoomReset };
 diff --git a/src/executor.ts b/src/executor.ts
-index 22b5d2f..125ba87 100644
+index 22b5d2f..a5b8622 100644
 --- a/src/executor.ts
 +++ b/src/executor.ts
 @@ -2,12 +2,25 @@ import type { Page } from "playwright";
@@ -305,23 +305,29 @@ index 22b5d2f..125ba87 100644
    audioDurationMs?: number;
    playAudio?: () => { kill: () => void; promise: Promise<unknown> };
    onActionStart?: (action: Action, index: number) => void;
-@@ -127,13 +157,22 @@ async function runSegment(
+@@ -127,13 +157,28 @@ async function runSegment(
      }
    }
  
-+  // Cinematic zoom: reset to natural scale at the scene start, then zoom into
-+  // the first focus action of the segment and hold for the rest.
-+  if (options.zoom) await zoomReset(page);
-+  let zoomed = false;
++  // Cinematic zoom: reset to natural scale at the scene start, then zoom once
++  // toward the segment's content anchor and hold. Anchor = the first
++  // type/select (the content focus, e.g. the chat input), else the first
++  // non-link click (skip "New Chat" and other nav links). -1 = no zoom.
++  let zoomIdx = -1;
++  if (options.zoom) {
++    await zoomReset(page);
++    zoomIdx = segment.actions.findIndex(a => (a.type === "type" || a.type === "select") && a.target);
++    if (zoomIdx === -1) {
++      zoomIdx = segment.actions.findIndex(a => a.type === "click" && a.target && a.target.role !== "link");
++    }
++  }
 +
    // Execute actions
    for (let i = 0; i < segment.actions.length; i++) {
      const action = segment.actions[i];
      options.onActionStart?.(action, i);
  
-+    const isFocus = action.type === "click" || action.type === "type" || action.type === "select";
-+    const zoomThis = options.zoom && !zoomed && isFocus && action.target ? options.zoom : undefined;
-+    if (zoomThis) zoomed = true;
++    const zoomThis = i === zoomIdx ? options.zoom : undefined;
 +
      try {
 -      await executeAction(page, action, { cursor: options.cursor });
@@ -410,7 +416,7 @@ index e47a70e..7c1eff7 100644
      if (fs.existsSync(titleSilencePath)) fs.unlinkSync(titleSilencePath);
      for (const segment of segments) {
 diff --git a/src/renderer.ts b/src/renderer.ts
-index f47c7ac..97f9442 100644
+index f47c7ac..e97723f 100644
 --- a/src/renderer.ts
 +++ b/src/renderer.ts
 @@ -75,11 +75,24 @@ async function render(
@@ -543,14 +549,16 @@ index f47c7ac..97f9442 100644
  
    const concatFilePath = path.join(framesDir, "frames.txt");
    let concatContent = "";
-@@ -257,15 +320,39 @@ async function render(
+@@ -257,15 +320,46 @@ async function render(
    fs.writeFileSync(concatFilePath, concatContent);
  
    const videoPath = path.join(outputDir, `${playbookName}-video.mp4`);
 +
-+  // Optional window framing: scale the content onto a padded background with a
-+  // soft drop shadow (Screen Studio look). Built as a filter_complex.
-+  const framingArgs: string[] = [];
++  // Optional window framing. The background + soft drop shadow are STATIC, so
++  // render them to a single PNG once; the per-frame work is then just
++  // scale + overlay (no per-frame blur — the expensive part).
++  const extraInputs: string[] = [];
++  let framingFilter = "";
 +  const fr = playbook.polish?.framing;
 +  if (fr?.enabled) {
 +    const W = scaledWidth, H = scaledHeight;
@@ -558,33 +566,40 @@ index f47c7ac..97f9442 100644
 +    const cw = Math.round(W * (1 - 2 * p) / 2) * 2;   // even
 +    const ch = Math.round(H * (1 - 2 * p) / 2) * 2;
 +    const ox = Math.round((W - cw) / 2), oy = Math.round((H - ch) / 2);
-+    const filter = fr.shadow
-+      ? `[0:v]scale=${cw}:${ch}[c];` +
-+        `color=c=${fr.background}:s=${W}x${H}[bg];` +
++    const bgPng = path.join(framesDir, "framing-bg.png");
++    const bgFilter = fr.shadow
++      ? `color=c=${fr.background}:s=${W}x${H}[bg];` +
 +        `color=c=black:s=${cw + 40}x${ch + 40}[ss];[ss]boxblur=18:1,format=rgba,colorchannelmixer=aa=0.45[sh];` +
-+        `[bg][sh]overlay=${ox - 20}:${oy - 20 + 22}[bg2];` +
-+        `[bg2][c]overlay=${ox}:${oy}:format=auto,format=yuv420p[out]`
-+      : `[0:v]scale=${cw}:${ch}[c];` +
-+        `color=c=${fr.background}:s=${W}x${H}[bg];` +
-+        `[bg][c]overlay=${ox}:${oy}:format=auto,format=yuv420p[out]`;
-+    framingArgs.push("-filter_complex", filter, "-map", "[out]");
++        `[bg][sh]overlay=${ox - 20}:${oy - 20 + 22},format=rgb24[out]`
++      : `color=c=${fr.background}:s=${W}x${H},format=rgb24[out]`;
++    await execa("ffmpeg", ["-y", "-filter_complex", bgFilter, "-map", "[out]", "-frames:v", "1", bgPng]);
++    extraInputs.push("-i", bgPng);
++    framingFilter = `[0:v]scale=${cw}:${ch}[c];[1:v][c]overlay=${ox}:${oy}:format=auto,format=yuv420p[out]`;
 +  }
++
++  // Hardware-accelerated encode on macOS (VideoToolbox uses the GPU/media
++  // engine); fall back to libx264 on other platforms.
++  const useVT = process.platform === "darwin";
++  const encodeArgs = useVT
++    ? ["-c:v", "h264_videotoolbox", "-b:v", "50M", "-allow_sw", "1", "-tag:v", "avc1"]
++    : ["-c:v", "libx264", "-crf", "17", "-preset", fr?.enabled ? "medium" : "slow"];
 +
    await execa("ffmpeg", [
      "-y",
      "-f", "concat",
      "-safe", "0",
      "-i", concatFilePath,
++    ...extraInputs,
      "-r", String(playbook.recording.fps),
-+    ...framingArgs,
-     "-c:v", "libx264",
-     "-crf", "17",
+-    "-c:v", "libx264",
+-    "-crf", "17",
 -    "-preset", "slow",
-+    "-preset", fr?.enabled ? "medium" : "slow",
++    ...(framingFilter ? ["-filter_complex", framingFilter, "-map", "[out]"] : []),
++    ...encodeArgs,
      "-pix_fmt", "yuv420p",
      videoPath,
    ]);
-@@ -277,17 +364,23 @@ async function render(
+@@ -277,17 +371,23 @@ async function render(
    console.log("\nMerging audio and video...");
    const finalOutput = outputPath ?? path.join(outputDir, `${playbookName}.mp4`);
  
