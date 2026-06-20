@@ -24,21 +24,47 @@ pieces needed for real-world product demos:
 - **Reliability fixes** — Retina-correct interactive window, popup suppression
   (translate / save-password / notifications), `exact` role-name matching,
   and a `close` that preserves the profile instead of wiping it.
+- **Re-dub + subtitles (no re-record)** — turn a finished recording into other
+  languages and burn minimalist subtitles, without driving the live app again.
 
-## Setup (once)
+## What the agent does from one sentence
+
+When the user says e.g. *"make a demo of <app> in German, English and Chinese with
+subtitles"*, you run the whole thing — the user only logs in once (SSO can't be
+automated for them) and approves. Your loop:
+
+1. **Prereqs** — `bash scripts/setup.sh` in the project (downloads a freetype
+   ffmpeg into `bin/`, checks node/yq/fonts, scaffolds `.env`,
+   `redub.config.json`, `i18n/narration.json`, updates `.gitignore`). Then
+   `bash scripts/install.sh` for the ndemo engine (only needed to *record*).
+2. **You author the playbook + narration** — write segments (one feature each) and
+   the spoken narration yourself. Do NOT ask the user to write narration. Follow
+   `references/authoring-narration.md` for length/timing/tone.
+3. **Record once** — `$NDEMO open`, user logs in, `$NDEMO capture-auth`, iterate
+   segments (`page-state` → actions → `play --segment`), then `$NDEMO render`.
+4. **Other languages** — translate narration into `i18n/narration.json`, then
+   `redub-tts` + `redub` per language (no re-record). Languages without a `tts`
+   entry get subtitles-only over the original audio.
+5. **Verify** — extract one frame per segment per language; eyeball sync + subs.
+
+So "one sentence" still implies: the user provides the app URL, performs the login
+when prompted, and approves the result. Everything else is yours.
+
+## Setup (once per machine/project)
 
 ```bash
-bash scripts/install.sh            # installs to ~/.claude/skills/ndemo
-# or: bash scripts/install.sh /path/to/ndemo
+bash scripts/setup.sh              # ffmpeg(+freetype) into bin/, deps + font check, scaffolds config/.env
+bash scripts/install.sh            # ndemo engine -> ~/.claude/skills/ndemo (only to RECORD new demos)
 ```
 
-This clones `splitbrain/ndemo`, applies `patches/ndemo-enhancements.patch`,
-runs `npm install && npm run build`, and installs the Playwright browser.
-Set a TTS key in your shell (never commit it):
+`setup.sh` is the important new step: Homebrew's default `ffmpeg` is **minimal**
+(no freetype/libass → no `drawtext`/`subtitles`), so subtitle burning fails. It
+fetches a full static ffmpeg into `bin/` and the redub scripts use it. Put the TTS
+key in `.env` (git-ignored), not the shell:
 
 ```bash
-export OPENAI_API_KEY=...        # for the default OpenAI voices
-export MINIMAX_API_KEY=...        # for MiniMax voices (provider: minimax)
+echo 'MINIMAX_API_KEY=...' > .env        # for MiniMax voices (provider: minimax)
+# OPENAI_API_KEY=... also works for upstream OpenAI voices during recording
 ```
 
 Throughout, `NDEMO=~/.claude/skills/ndemo/ndemo`.
@@ -210,6 +236,10 @@ the ffmpeg/font setup.
 - `references/redub-and-subtitles.md` — re-dub a finished recording into other
   languages + burn minimalist subtitles without re-recording (drawtext, not
   libass; ffmpeg-with-freetype setup; keep-audio vs dub modes).
+- `references/authoring-narration.md` — how to write narration + translations that
+  fit the segment windows (you author these, not the user): length, timing, tone.
+- `scripts/setup.sh` — per-machine prep: static ffmpeg, dependency + font checks,
+  config/.env scaffolding.
 - `assets/templates/` — ready-to-edit playbook + re-dub templates.
 
 ## Credit
