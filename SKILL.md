@@ -1,6 +1,6 @@
 ---
 name: narrated-web-app-demo
-description: Create narrated, voice-over screen-recording demo videos of web applications — including authenticated apps behind SSO/login. Drives a real browser through scripted UI actions with an animated cursor and button highlights, generates per-segment TTS narration, and renders a 4K MP4. Use when asked to "make a demo video", "record a product walkthrough", "screen recording with voiceover", "演示视频", "录制产品演示", or to showcase the features of a web app. Built on top of the `ndemo` toolkit (github.com/splitbrain/ndemo) plus enhancements for authenticated apps, file upload, multi-provider TTS, and reliable headless rendering.
+description: Create narrated, voice-over screen-recording demo videos of web applications — including authenticated apps behind SSO/login. Drives a real browser through scripted UI actions with an animated cursor and button highlights, generates per-segment TTS narration, and renders a 4K MP4. Use when asked to "make a demo video", "record a product walkthrough", "screen recording with voiceover", "演示视频", "录制产品演示", or to showcase the features of a web app. Built on top of the `ndemo` toolkit (github.com/splitbrain/ndemo) plus enhancements for authenticated apps, file upload, multi-provider TTS, and reliable headless rendering. 中文触发 — 产品演示视频, 给投资人看的演示, 功能录制, 教程视频, 制作演示视频.
 allowed-tools: [Bash, Read, Write, Edit, Glob, Grep]
 ---
 
@@ -172,6 +172,34 @@ polish:
 - **idle speed-up** — not a flag: use smart `done: { stable: ... }` waits so a
   segment ends the moment the page settles (no dead time). `done` is non-fatal.
 
+## Re-dub into other languages + burn subtitles (no re-record)
+
+Already have a finished recording and want English / Chinese / … versions with
+subtitles? Do **not** re-render (it re-drives the live app and, for LLM apps,
+changes the on-screen output). Reuse the recorded pixels: swap the narration audio
+and burn minimalist subtitles.
+
+```bash
+cp ~/.claude/skills/narrated-web-app-demo/assets/templates/redub.config.template.json   redub.config.json
+cp ~/.claude/skills/narrated-web-app-demo/assets/templates/narration.template.json      i18n/narration.json
+# fill narration.json (per-part text per language + outro cards + tts voices)
+set -a; . ./.env; set +a                       # MINIMAX_API_KEY
+node ~/.claude/skills/narrated-web-app-demo/scripts/redub-tts.mjs en   # synth audio-en/
+node ~/.claude/skills/narrated-web-app-demo/scripts/redub.mjs    en    # -> demo-final-en.mp4
+node ~/.claude/skills/narrated-web-app-demo/scripts/redub.mjs    de    # original lang: subtitles only
+```
+
+- A language **with** a `tts.<lang>` entry → full re-dub (TTS audio at the original
+  segment offsets, fit-to-window, translated end card).
+- A language **without** one → keep-audio mode (original audio untouched, subtitles
+  only, original end card kept) — perfect for subtitling the original language.
+- Subtitles are rendered with `drawtext`, **not libass** (libass injects a phantom
+  comma glyph on multi-event files). Needs an ffmpeg with freetype — Homebrew's
+  default ffmpeg is minimal; fetch a full static build (see the reference).
+
+See `references/redub-and-subtitles.md` for the full how-to, the libass gotcha, and
+the ffmpeg/font setup.
+
 ## References
 
 - `references/authenticated-apps.md` — capture/restore auth, scripted SSO login,
@@ -179,7 +207,10 @@ polish:
 - `references/gotchas.md` — every hard-won lesson: timing/sync, render crashes,
   Retina window, popup suppression, native `<select>` handling, exact matching,
   file upload.
-- `assets/templates/` — ready-to-edit playbook templates.
+- `references/redub-and-subtitles.md` — re-dub a finished recording into other
+  languages + burn minimalist subtitles without re-recording (drawtext, not
+  libass; ffmpeg-with-freetype setup; keep-audio vs dub modes).
+- `assets/templates/` — ready-to-edit playbook + re-dub templates.
 
 ## Credit
 
