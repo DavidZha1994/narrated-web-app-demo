@@ -1,8 +1,13 @@
 # narrated-web-app-demo
 
-A [Claude Code](https://claude.com/claude-code) **skill** for producing
-narrated, voice-over screen-recording demo videos of web applications —
-including apps behind **SSO / login**.
+A coding-agent **skill** for producing narrated, voice-over screen-recording
+demo videos of web applications — including apps behind **SSO / login**.
+
+Works with [Claude Code](https://claude.com/claude-code) (`SKILL.md`),
+[OpenAI Codex](https://github.com/openai/codex) (`AGENTS.md`), and
+[Gemini CLI](https://github.com/google-gemini/gemini-cli) (`GEMINI.md`). The
+workflow is plain shell around the `ndemo` CLI, so any agent that can run a
+shell and edit files can drive it — see [Compatibility](#compatibility).
 
 You describe the tour as a YAML *playbook* (segments = narration + browser
 actions). A headless Chromium is driven through it with an animated cursor and
@@ -55,6 +60,22 @@ See **[`SKILL.md`](SKILL.md)** for the full workflow and
 **[`references/`](references/)** for the authenticated-app guide and the list of
 gotchas (voice-over sync, render-crash avoidance, native `<select>` handling,
 file upload, …).
+
+## Compatibility
+
+The skill does **not** call any model API — it drives the `ndemo` Node CLI via
+shell commands. Each supported agent just needs an entry file it auto-loads:
+
+| Agent | Entry file | Notes |
+|---|---|---|
+| Claude Code | [`SKILL.md`](SKILL.md) | Native skill; `allowed-tools` frontmatter honored. |
+| OpenAI Codex | [`AGENTS.md`](AGENTS.md) | Points to `SKILL.md` + tool-name mapping. |
+| Gemini CLI | [`GEMINI.md`](GEMINI.md) | `@`-imports `SKILL.md`. |
+
+`AGENTS.md` / `GEMINI.md` are thin — `SKILL.md` stays the single source of
+truth. The only cross-agent differences are tool names (Claude's `Bash`/`Read`
+vs. your shell/file tools) and the install path (default
+`~/.claude/skills/ndemo`, overridable via `scripts/install.sh <path>`).
 
 ## Security
 
